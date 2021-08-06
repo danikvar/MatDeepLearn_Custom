@@ -1,5 +1,5 @@
 Job:
-    run_mode: "Training"  
+    run_mode: "Bootstrap_Pred"  
     #{Training, Predict, Repeat, CV, Hyperparameter, Ensemble, Analysis}
     Training:
         job_name: "my_train_job"
@@ -11,7 +11,20 @@ Job:
         write_output: "True"
         parallel: "True"
         #seed=0 means random initalization
-        seed: 0        
+        seed: 0
+    Bootstrap_Pred:
+        job_name: "my_bootstrap_job"
+        reprocess: "False"    
+        model: CGCNN_demo   
+        load_model: "False"
+        save_model: "True"
+        model_n: "my_model.pth"
+        model_path: "models_bootstrap"
+        write_output: "True"
+        parallel: "True"
+        boot_samples: 50
+        #seed=0 means random initalization
+        seed: 0                
     Predict:
         job_name: "my_predict_job"
         reprocess: "False"    

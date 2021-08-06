@@ -93,6 +93,14 @@ def get_dataset(data_path, target_index, reprocess="False", processing_args=None
     transforms = GetY(index=target_index)
 
     if os.path.exists(data_path) == False:
+        #print(os.getcwd())
+        """
+        print(os.getcwd())
+        print(os.path.exists(os.path.join(os.getcwd(), data_path)))
+        print(os.path.join(os.getcwd(), data_path))
+        print([(x[0]) for x in os.walk(os.getcwd())][0])
+        """
+        
         print("Data not found in:", data_path)
         sys.exit()
 

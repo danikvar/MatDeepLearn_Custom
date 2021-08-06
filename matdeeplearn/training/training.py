@@ -8,6 +8,7 @@ import copy
 import numpy as np
 from functools import partial
 import platform
+import random
 
 ##Torch imports
 import torch.nn.functional as F
@@ -1288,3 +1289,443 @@ def analysis(
     # cbar.ax.tick_params(size=40)
     plt.savefig("tsne_output.png", format="png", dpi=600)
     plt.show()
+
+
+    ############### Functions for Ensemble CI Estimation #######################
+
+#make sure to always include 0!
+def create_random_indices(my_range, num_samples):
+    indices = list()
+    for samp in range(0, num_samples):
+        cur_choices = random.choices(my_range, k = len(my_range))
+        indices.append(cur_choices)
+    return indices
+
+#returns a list of training model splits while keeping a single val and test set
+def split_data_bootstrap(
+    dataset,
+    train_ratio,
+    val_ratio,
+    test_ratio,
+    seed=np.random.randint(1, 1e6),
+    save=False,
+    num_samples = 50,
+):
+    dataset_size = len(dataset)
+    if (train_ratio + val_ratio + test_ratio) <= 1:
+        train_length = int(dataset_size * train_ratio)
+        val_length = int(dataset_size * val_ratio)
+        test_length = int(dataset_size * test_ratio)
+        unused_length = dataset_size - train_length - val_length - test_length
+        (
+            train_dataset,
+            val_dataset,
+            test_dataset,
+            unused_dataset,
+        ) = torch.utils.data.random_split(
+            dataset,
+            [train_length, val_length, test_length, unused_length],
+            generator=torch.Generator().manual_seed(seed),
+        )
+        
+        
+        total_ind = train_dataset.indices
+        c_range = range(0, len(total_ind))
+        my_indices = create_random_indices(c_range, num_samples)
+        training_bootstrapped = []
+
+
+        for ind in my_indices:
+            my_tr = copy.copy(train_dataset)
+            my_tr.indices = ind
+            training_bootstrapped.append(my_tr)
+
+
+        print(
+            "train length:",
+            train_length,
+            "val length:",
+            val_length,
+            "test length:",
+            test_length,
+            "unused length:",
+            unused_length,
+            "seed :",
+            seed,
+        )
+        return training_bootstrapped, val_dataset, test_dataset
+    else:
+        print("invalid ratios")
+        
+        
+        
+## Loading a list of bootstrapped training subsets in order to train ensemble models
+def loader_setup_bootstrap(
+    train_ratio,
+    val_ratio,
+    test_ratio,
+    batch_size,
+    dataset,
+    rank,
+    seed,
+    world_size=0,
+    num_workers=0,
+    num_samples = 50,
+):
+    ##Split datasets
+    train_sets, val_dataset, test_dataset = split_data_bootstrap(
+        dataset, train_ratio, val_ratio, test_ratio, seed, num_samples = num_samples
+    )
+    
+    #print(str(type(train_sets)) + "_1")
+
+    ##DDP
+    if rank not in ("cpu", "cuda"):
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank
+        )
+    elif rank in ("cpu", "cuda"):
+        train_sampler = None
+
+        #print(str(type(train_sets)) + "_2")
+        
+    ##Load data
+    train_loader = val_loader = test_loader = None
+    t_loader_list = []
+    
+    #print(type(train_sets))
+    
+    for train_dataset in train_sets:
+        #print(str(type(train_sets)) + "_3")
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=(train_sampler is None),
+            num_workers=num_workers,
+            pin_memory=True,
+            sampler=train_sampler,
+        )
+        
+        #print(str(type(t_loader_list)) + "_4")
+        t_loader_list.append(copy.copy(train_loader))
+        train_loader = None
+        #print(str(type(train_sets)) + "_5")
+    # may scale down batch size if memory is an issue
+    if rank in (0, "cpu", "cuda"):
+        if len(val_dataset) > 0:
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=True,
+            )
+        if len(test_dataset) > 0:
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=True,
+            )
+            
+    #print(str(type(train_sets)) + "_6")
+    #print(str(type(copy.copy(train_sets))) + "****************")
+    return(
+        t_loader_list,
+        val_loader,
+        test_loader,
+        train_sampler,
+        train_sets,
+        val_dataset,
+        test_dataset
+    )
+
+
+
+#Training using the bootstrap method
+def train_regular_bootstrap(
+    rank,
+    world_size,
+    data_path,
+    job_parameters=None,
+    training_parameters=None,
+    model_parameters=None,
+    n_samples = 50,
+    get_CI = True
+):
+    ##DDP
+    ddp_setup(rank, world_size)
+    ##some issues with DDP learning rate
+    if rank not in ("cpu", "cuda"):
+        model_parameters["lr"] = model_parameters["lr"] * world_size
+
+    ##Get dataset
+    dataset = process.get_dataset(data_path, training_parameters["target_index"], False)
+
+    if rank not in ("cpu", "cuda"):
+        dist.barrier()
+
+    ##Set up loader
+    (
+        t_loaders,
+        val_loader,
+        test_loader,
+        train_sampler,
+        train_sets,
+        _,
+        _,
+    ) = loader_setup_bootstrap(
+        training_parameters["train_ratio"],
+        training_parameters["val_ratio"],
+        training_parameters["test_ratio"],
+        model_parameters["batch_size"],
+        dataset,
+        rank,
+        job_parameters["seed"],
+        world_size,
+        num_samples = n_samples,
+    )
+    
+    if rank in (0, "cpu", "cuda"):
+        train_error_tot = []
+        val_error_tot = []
+        test_error_tot = []
+
+    for i in range(0, len(t_loaders)):
+    ##Set up model
+    
+        my_split = job_parameters["model_n"].find('.')
+       
+        model_name = os.path.join(
+            job_parameters["model_path"], 
+            job_parameters["model_n"][:my_split] + "_" + 
+            str(i) + job_parameters["model_n"][my_split:]
+            )
+        
+        ########### USE .training #############
+        model = training.model_setup(
+            rank,
+            model_parameters["model"],
+            model_parameters,
+            dataset,
+            job_parameters["load_model"],
+            model_name,
+            model_parameters.get("print_model", True),
+        )
+
+        ##Set-up optimizer & scheduler
+        optimizer = getattr(torch.optim, model_parameters["optimizer"])(
+            model.parameters(),
+            lr=model_parameters["lr"],
+            **model_parameters["optimizer_args"]
+        )
+        scheduler = getattr(torch.optim.lr_scheduler, model_parameters["scheduler"])(
+            optimizer, **model_parameters["scheduler_args"]
+        )
+
+        ##Start training
+        ########### USE .training #############
+        model = training.trainer(
+            rank,
+            world_size,
+            model,
+            optimizer,
+            scheduler,
+            training_parameters["loss"],
+            t_loaders[i],
+            val_loader,
+            train_sampler,
+            model_parameters["epochs"],
+            training_parameters["verbosity"],
+            "my_model_temp.pth",
+        )
+
+        if rank in (0, "cpu", "cuda"):
+
+            train_error = val_error = test_error = float("NaN")
+
+            ##workaround to get training output in DDP mode
+            ##outputs are slightly different, could be due to dropout or batchnorm?
+            train_loader = DataLoader(
+                train_sets[i],
+                batch_size=model_parameters["batch_size"],
+                shuffle=False,
+                num_workers=0,
+                pin_memory=True,
+            )
+
+            ##Get train error in eval mode
+            ########### USE .training #############
+            train_error, train_out = training.evaluate(
+                train_loader, model, training_parameters["loss"], rank, out=True
+            )
+            print("Train Error: {:.5f}".format(train_error))
+
+            ##Get val error
+            if val_loader != None:
+                ########### USE .training #############
+                val_error, val_out = training.evaluate(
+                    val_loader, model, training_parameters["loss"], rank, out=True
+                )
+                print("Val Error: {:.5f}".format(val_error))
+
+            ##Get test error
+            if test_loader != None:
+                ########### USE .training #############
+                test_error, test_out = training.evaluate(
+                    test_loader, model, training_parameters["loss"], rank, out=True
+                )
+                print("Test Error: {:.5f}".format(test_error))
+
+            ##Save model
+            if job_parameters["save_model"] == "True":
+                
+                if rank not in ("cpu", "cuda"):
+                    torch.save(
+                        {
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "scheduler_state_dict": scheduler.state_dict(),
+                            "full_model": model,
+                        },
+                         model_name,
+                    )
+                else:
+                    torch.save(
+                        {
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "scheduler_state_dict": scheduler.state_dict(),
+                            "full_model": model,
+                        },
+                         model_name,
+                    )
+
+            ##Write outputs
+            model_name = os.path.join(
+            job_parameters["model_path"], 
+            job_parameters["model_n"][:my_split] + "_" + 
+            str(i) + job_parameters["model_n"][my_split:]
+            )
+
+            if job_parameters["write_output"] == "True":
+                ########### USE .training #############
+                training.write_results(
+                    train_out, os.path.join(job_parameters["model_path"], 
+                    str(job_parameters["job_name"]) + "_" + str(i) + "_train_outputs.csv")
+                )
+                if val_loader != None:
+                    ########### USE .training #############
+                    training.write_results(
+                        val_out, os.path.join(job_parameters["model_path"],
+                        str(job_parameters["job_name"]) + "_" + str(i) + "_val_outputs.csv")
+                    )
+                if test_loader != None:
+                    ########### USE .training #############
+                    training.write_results(
+                        test_out, os.path.join(job_parameters["model_path"],
+                        str(job_parameters["job_name"]) + "_" + str(i) + "_test_outputs.csv")
+                    )
+
+            if rank not in ("cpu", "cuda"):
+                dist.destroy_process_group()
+
+        ##Write out model performance to file
+            error_values = np.array((train_error.cpu(), val_error.cpu(), test_error.cpu()))
+            if job_parameters.get("write_error") == "True":
+                np.savetxt(
+                    job_parameters["job_name"] + "_" + str(i) + "_errorvalues.csv",
+                    error_values[np.newaxis, ...],
+                    delimiter=",",
+                )          
+    if get_CI == True:     
+        predict_ci(training_parameters["loss"], n_samples, job_parameters, rank, test_loader)
+    return error_values
+
+
+
+#used to verify that all of our test values are equal
+def all_equal(iterator):
+    iterator = iter(iterator)
+    try:
+        first = next(iterator)
+    except StopIteration:
+        return True
+    val = []
+    for x in iterator:
+        val.append(np.array_equal(first, x))
+    return all(val)
+
+
+def predict_ci(loss, num_models, job_parameters, rank, loader, write_output = True):
+    models = []
+    predictions = []
+    target_val = []
+    labs_target = []
+    my_split = job_parameters["model_n"].find('.')
+
+    for i in range(0,num_models):
+        if str(rank) == "cpu":
+            saved = torch.load(
+                os.path.join(job_parameters["model_path"],
+                             job_parameters["model_n"][:my_split] + "_" + 
+                             str(i) + job_parameters["model_n"][my_split:]),
+                             map_location=torch.device("cpu")
+            )
+        else:
+            saved = torch.load(
+                os.path.join(job_parameters["model_path"],
+                             job_parameters["model_n"][:my_split] + "_" + 
+                             str(i) + job_parameters["model_n"][my_split:]),
+                             map_location=torch.device("cuda")
+            )
+
+        model = saved["full_model"]
+        model = model.to(rank)
+        model_summary(model)
+        time_start = time.time()
+        test_error, test_out = training.evaluate(loader, model, loss, rank, out=True)
+        elapsed_time = time.time() - time_start
+        if i == 0:
+            labs_target = test_out[:,[0,1]]
+        target_val.append(test_out[:,1])
+        predictions.append(test_out[:,2])
+
+    print("All test values the same: " + str(all_equal(target_val)))
+    float_pred = [i.astype(float) for i in predictions]
+
+    means = np.mean(float_pred, axis = 0)
+    two_sd = np.std(float_pred, axis = 0)*2
+    top_ci = np.add(means, two_sd)
+    bot_ci = np.subtract(means, two_sd)
+
+    #labs_target = labs_target.reshape(labs_target.shape[0],-1)
+    #targets = target_val[0].reshape(target_val[0].shape[0],-1)
+    bot_ci = bot_ci.reshape(bot_ci.shape[0],-1)
+    means = means.reshape(means.shape[0],-1)
+    top_ci = top_ci.reshape(top_ci.shape[0],-1)
+    all_ci_dat = (np.concatenate((labs_target,bot_ci, means, top_ci),axis=1))
+    in_ci = np.array([int(row[2] <= row[3] <= row[4]) for row in all_ci_dat])
+    in_ci = in_ci.reshape(in_ci.shape[0],-1)
+    all_ci_dat = np.concatenate((all_ci_dat,in_ci), axis = 1)
+
+    print("% of targets inside CI:" + str((sum(in_ci)/len(in_ci))[0]))
+    if write_output == True:
+
+        with open(str(job_parameters["job_name"])+ "_confidence_int.csv", "w") as f:
+            csvwriter = csv.writer(f)
+            for i in range(0, len(all_ci_dat) + 1):
+                if i == 0:
+                    csvwriter.writerow(
+                        [
+                            "ids",
+                            "target",
+                            "bottom_confidence_interval",
+                            "mean_output",
+                            "top_confidence_interval",
+                            "inside_ci"
+                        ]
+                    )
+                elif i > 0:
+                    csvwriter.writerow(all_ci_dat[i - 1, :])

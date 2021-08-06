@@ -149,6 +149,8 @@ def main():
     if args.run_mode != None:
         config["Job"]["run_mode"] = args.run_mode
     run_mode = config["Job"].get("run_mode")
+    
+  
     config["Job"] = config["Job"].get(run_mode)
     if config["Job"] == None:
         print("Invalid run mode")
@@ -518,6 +520,63 @@ def main():
             config["Training"],
             config["Models"],
         )
+    ##Enemble Confidence Intervals
+    elif run_mode == "Bootstrap_Pred":
+
+        print("Starting regular training")
+        print(
+            "running for "
+            + str(config["Models"]["epochs"])
+            + " epochs"
+            + " on "
+            + str(config["Job"]["model"])
+            + " model" 
+            + " with "
+            + str(config["Job"]["boot_samples"])
+            + " bootstrapped "
+            + " samples "
+        )
+        world_size = torch.cuda.device_count()
+        if world_size == 0:
+            print("Running on CPU - this will be slow")
+            training.train_regular_bootstrap(
+                "cpu",
+                world_size,
+                config["Processing"]["data_path"],
+                config["Job"],
+                config["Training"],
+                config["Models"],
+                n_samples = config["Job"]["boot_samples"],
+            )
+            
+
+        elif world_size > 0:
+            if config["Job"]["parallel"] == "True":
+                print("Running on", world_size, "GPUs")
+                mp.spawn(
+                    training.train_regular_bootstrap,
+                    args=(
+                        world_size,
+                        config["Processing"]["data_path"],
+                        config["Job"],
+                        config["Training"],
+                        config["Models"],
+                        config["Job"]["boot_samples"],
+                    ),
+                    nprocs=world_size,
+                    join=True,
+                )
+            if config["Job"]["parallel"] == "False":
+                print("Running on one GPU")
+                training.train_regular(
+                    "cuda",
+                    world_size,
+                    config["Processing"]["data_path"],
+                    config["Job"],
+                    config["Training"],
+                    config["Models"],
+                    config["Job"]["boot_samples"],
+                )
 
     ##Analysis mode
     ##NOTE: this only works for "early" pooling option, because it assumes the graph-level features are plotted, not the node-level ones
