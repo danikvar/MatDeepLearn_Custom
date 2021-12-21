@@ -9,6 +9,7 @@ from torch_geometric.nn import (
     global_add_pool,
     global_max_pool,
     NNConv,
+    DiffGroupNorm
 )
 from torch_scatter import scatter_mean, scatter_add, scatter_max, scatter
 
@@ -92,7 +93,8 @@ class MPNN(torch.nn.Module):
 
             ##Track running stats set to false can prevent some instabilities; this causes other issues with different val/test performance from loader size?
             if self.batch_norm == "True":
-                bn = BatchNorm1d(gc_dim, track_running_stats=self.batch_track_stats)
+                #bn = BatchNorm1d(gc_dim, track_running_stats=self.batch_track_stats)
+                bn = DiffGroupNorm(gc_dim, 10, track_running_stats=self.batch_track_stats)
                 self.bn_list.append(bn)
 
         ##Set up post-GNN dense layers (NOTE: in v0.1 there was a minimum of 2 dense layers, and fc_count(now post_fc_count) added to this number. In the current version, the minimum is zero)
@@ -133,9 +135,13 @@ class MPNN(torch.nn.Module):
             if i == 0:
                 out = self.pre_lin_list[i](data.x)
                 out = getattr(F, self.act)(out)
+                #prev_out = out
             else:
                 out = self.pre_lin_list[i](out)
                 out = getattr(F, self.act)(out)
+                #out = torch.add(out, prev_out)
+                #prev_out = out
+        prev_out = out
 
         ##GNN layers
         if len(self.pre_lin_list) == 0:
@@ -158,7 +164,9 @@ class MPNN(torch.nn.Module):
             m = getattr(F, self.act)(m)          
             m = F.dropout(m, p=self.dropout_rate, training=self.training)
             out, h = self.gru_list[i](m.unsqueeze(0), h)
-            out = out.squeeze(0)                
+            out = out.squeeze(0)
+            out = torch.add(out, prev_out)
+            prev_out = out            
 
         ##Post-GNN dense layers
         if self.pool_order == "early":
@@ -169,16 +177,27 @@ class MPNN(torch.nn.Module):
             for i in range(0, len(self.post_lin_list)):
                 out = self.post_lin_list[i](out)
                 out = getattr(F, self.act)(out)
+                #out = torch.add(out, prev_out)
+                #prev_out = out
             out = self.lin_out(out)
+            #out = torch.add(out, prev_out)
+            #prev_out = out
 
         elif self.pool_order == "late":
             for i in range(0, len(self.post_lin_list)):
                 out = self.post_lin_list[i](out)
                 out = getattr(F, self.act)(out)
+                #out = torch.add(out, prev_out)
+                #prev_out = out
             out = self.lin_out(out)
+            #out = torch.add(out, prev_out)
+            #prev_out = out
+
             if self.pool == "set2set":
                 out = self.set2set(out, data.batch)
                 out = self.lin_out_2(out)
+                #out = torch.add(out, prev_out)
+                #prev_out = out
             else:
                 out = getattr(torch_geometric.nn, self.pool)(out, data.batch)
                 

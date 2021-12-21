@@ -1,30 +1,53 @@
 Job:
-    run_mode: "Bootstrap_Pred"  
+    run_mode: "Evidential"  
     #{Training, Predict, Repeat, CV, Hyperparameter, Ensemble, Analysis}
     Training:
         job_name: "my_train_job"
         reprocess: "False"    
-        model: CGCNN_demo   
+        model: MEGNet_demo   
         load_model: "False"
         save_model: "True"
         model_path: "my_model.pth"
         write_output: "True"
         parallel: "True"
         #seed=0 means random initalization
-        seed: 0
+        seed: 0 
+    Evidential:
+        job_name: "my_evidential_job"
+        reprocess: "False"    
+        model: MEGNet_EV_demo   
+        load_model: "False"
+        save_model: "True"
+        model_path: "my_model.pth"
+        write_output: "True"
+        parallel: "False"
+        #seed=0 means random initalization
+        seed: 0        
+    Inductive_Conformal:
+        job_name: "my_conformal_job"
+        error_model_path: "error_model.pth"
+        reprocess: "True"    
+        model: MEGNet_demo   
+        load_model: "False"
+        save_model: "True"
+        model_path: "my_model.pth"
+        write_output: "True"
+        parallel: "True"
+        #seed=0 means random initalization
+        seed: 98     
     Bootstrap_Pred:
         job_name: "my_bootstrap_job"
         reprocess: "False"    
-        model: CGCNN_demo   
+        model: MEGNet_demo   
         load_model: "False"
         save_model: "True"
         model_n: "my_model.pth"
         model_path: "models_bootstrap"
         write_output: "True"
-        parallel: "True"
+        parallel: "False"
         boot_samples: 50
         #seed=0 means random initalization
-        seed: 0                
+        seed: 0                 
     Predict:
         job_name: "my_predict_job"
         reprocess: "False"    
@@ -92,7 +115,9 @@ Processing:
     #Whether to use "inmemory" or "large" format for pytorch-geometric dataset. Reccomend inmemory unless the dataset is too large
     dataset_type: "inmemory"  
     #Path to data files
-    data_path: "/data" 
+    data_path: "/data/pt_data/pt_data_2" 
+    #Path to error targets to be saved in data_path
+    target_path_errors: 'error_targets.csv'
     #Path to target file within data_path
     target_path: "targets.csv"
     #Method of obtaining atom idctionary: available:(provided, default, blank, generated)
@@ -121,14 +146,14 @@ Processing:
 Training:     
     #Index of target column in targets.csv
     target_index: 0
-    #Loss functions (from pytorch) examples: l1_loss, mse_loss, binary_cross_entropy
+    #Loss functions (from pytorch) examples: l1_loss, mse_loss, binary_cross_entropy, (and evidential)
     loss: "l1_loss"       
     #Ratios for train/val/test split out of a total of 1  
-    train_ratio: 0.8
-    val_ratio: 0.05
+    train_ratio: 0.75
+    val_ratio: 0.1
     test_ratio: 0.15
     #Training print out frequency (print per n number of epochs)
-    verbosity: 5
+    verbosity: 1
     
 Models:        
     CGCNN_demo:
@@ -150,7 +175,88 @@ Models:
         optimizer: "AdamW"
         optimizer_args: {}
         scheduler: "ReduceLROnPlateau"
-        scheduler_args: {"mode":"min", "factor":0.8, "patience":10, "min_lr":0.00001, "threshold":0.0002}                        
+        scheduler_args: {"mode":"min", "factor":0.8, "patience":10, "min_lr":0.00001, "threshold":0.0002} 
+    CGCNN_bbp_demo:
+        model: CGCNN_bbp
+        dim1: 100
+        dim2: 150
+        pre_fc_count: 1
+        gc_count: 4
+        post_fc_count: 2
+        pool: "global_mean_pool"
+        pool_order: "early"
+        batch_norm: "True"
+        batch_track_stats: "True"
+        act: "relu"
+        dropout_rate: 0.0
+        epochs: 250
+        lr: 0.002
+        batch_size: 100
+        optimizer: "AdamW"
+        optimizer_args: {}
+        scheduler: "ReduceLROnPlateau"
+        scheduler_args: {"mode":"min", "factor":0.8, "patience":10, "min_lr":0.00001, "threshold":0.0002} 
+    GATGNN_demo:
+        model: GATGNN
+        dim1: 64
+        dim2: 150
+        pre_fc_count: 1
+        gc_count: 5
+        post_fc_count: 0
+        pool: "global_add_pool"
+        pool_order: "early"
+        batch_norm: "True"
+        batch_track_stats: "True"
+        act: "softplus"
+        dropout_rate: 0.0
+        epochs: 250
+        lr: 0.005
+        batch_size: 100
+        optimizer: "AdamW"
+        optimizer_args: {}
+        scheduler: "ReduceLROnPlateau"
+        scheduler_args: {"mode":"min", "factor":0.8, "patience":10, "min_lr":0.00001, "threshold":0.0002}   
+    DEEP_GATGNN_demo:
+        model: DEEP_GATGNN
+        dim1: 64
+        dim2: 150
+        pre_fc_count: 1
+        gc_count: 10
+        post_fc_count: 0
+        pool: "global_add_pool"
+        pool_order: "early"
+        batch_norm: "True"
+        batch_track_stats: "True"
+        act: "softplus"
+        dropout_rate: 0.0
+        epochs: 250
+        lr: 0.005
+        batch_size: 100
+        optimizer: "AdamW"
+        optimizer_args: {}
+        scheduler: "ReduceLROnPlateau"
+        scheduler_args: {"mode":"min", "factor":0.8, "patience":10, "min_lr":0.00001, "threshold":0.0002}
+    MPNN_Bayes_demo:
+        model: MPNN_Bayes
+        dim1: 100
+        dim2: 100
+        dim3: 100
+        pre_fc_count: 1
+        gc_count: 4
+        post_fc_count: 3
+        pool: "global_mean_pool"
+        pool_order: "early"
+        batch_norm: "True"
+        batch_track_stats: "True"
+        act: "relu"
+        dropout_rate: 0.0
+        epochs: 250
+        lr: 0.001
+        batch_size: 100
+        optimizer: "AdamW"
+        optimizer_args: {}
+        scheduler: "ReduceLROnPlateau"
+        scheduler_args: {"mode":"min", "factor":0.8, "patience":10, "min_lr":0.00001, "threshold":0.0002}
     MPNN_demo:
         model: MPNN
         dim1: 100
@@ -171,7 +277,7 @@ Models:
         optimizer: "AdamW"
         optimizer_args: {}
         scheduler: "ReduceLROnPlateau"
-        scheduler_args: {"mode":"min", "factor":0.8, "patience":10, "min_lr":0.00001, "threshold":0.0002}               
+        scheduler_args: {"mode":"min", "factor":0.8, "patience":10, "min_lr":0.00001, "threshold":0.0002}
     SchNet_demo:
         model: SchNet
         dim1: 100
@@ -209,13 +315,36 @@ Models:
         batch_track_stats: "True"
         act: "relu"
         dropout_rate: 0.0
-        epochs: 250
+        epochs: 300
         lr: 0.0005
         batch_size: 100
         optimizer: "AdamW"
         optimizer_args: {}
         scheduler: "ReduceLROnPlateau"
-        scheduler_args: {"mode":"min", "factor":0.8, "patience":10, "min_lr":0.00001, "threshold":0.0002}              
+        scheduler_args: {"mode":"min", "factor":0.8, "patience":10, "min_lr":0.00001, "threshold":0.0002}  
+    MEGNet_EV_demo:
+        model: MEGNet_EV
+        dim1: 100
+        dim2: 100
+        dim3: 100
+        pre_fc_count: 1
+        gc_count: 4
+        gc_fc_count: 1
+        post_fc_count: 3
+        pool: "global_mean_pool"
+        pool_order: "early"
+        batch_norm: "True"
+        batch_track_stats: "True"
+        act: "relu"
+        dropout_rate: 0.0
+        epochs: 300
+        lr: 0.0005
+        batch_size: 100
+        optimizer: "AdamW"
+        optimizer_args: {}
+        scheduler: "ReduceLROnPlateau"
+        scheduler_args: {"mode":"min", "factor":0.8, "patience":10, "min_lr":0.00001, "threshold":0.0002}
+        coeff: 0.01
     GCN_demo:
         model: GCN
         dim1: 100

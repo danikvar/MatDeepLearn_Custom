@@ -9,6 +9,7 @@ import numpy as np
 from functools import partial
 import platform
 import random
+import pandas as pd
 
 ##Torch imports
 import torch.nn.functional as F
@@ -32,7 +33,106 @@ from matdeeplearn.models.utils import model_summary
 ################################################################################
 
 ##Train step, runs model in train mode
-def train(model, optimizer, loader, loss_method, rank):
+
+def nig_nll(y, gamma, v, alpha, beta):
+    two_blambda = 2 * beta * (1 + v)
+    nll = 0.5 * torch.log(np.pi / v) \
+            - alpha * torch.log(two_blambda) \
+            + (alpha + 0.5) * torch.log(v * (y - gamma) ** 2 + two_blambda) \
+            + torch.lgamma(alpha) \
+            - torch.lgamma(alpha + 0.5)
+
+    return nll
+
+
+def nig_reg(y, gamma, v, alpha, beta):
+    error = F.l1_loss(y, gamma, reduction="none")
+    evi = 2 * v + alpha
+    return error * evi
+
+
+def evidential_regresssion_loss(y, pred, coeff=0.05):
+    gamma = torch.flatten(pred[0])
+    v = torch.flatten(pred[1])
+    alpha = torch.flatten(pred[2])
+    beta = torch.flatten(pred[3])
+
+    loss_nll = nig_nll(y, gamma, v, alpha, beta)
+    loss_reg = nig_reg(y, gamma, v, alpha, beta)
+    return loss_nll.mean() + coeff * loss_reg.mean()
+
+def ev_evaluate(loader, model, loss_method, rank, out=False, my_coeff = 0.5):
+    model.eval()
+    loss_all = 0
+    count = 0
+    for data in loader:
+        data = data.to(rank)
+        with torch.no_grad():
+            output = model(data)
+            
+            loss =  evidential_regresssion_loss(data.y, output, my_coeff)
+            
+            
+            loss_all += loss * torch.flatten(output[0]).size(0)
+            
+            if out == True:
+                if count == 0:
+                    ids = [item for sublist in data.structure_id for item in sublist]
+                    ids = [item for sublist in ids for item in sublist]
+                    mu = torch.flatten(output[0])
+                    v = torch.flatten(output[1])
+                    alpha = torch.flatten(output[2])
+                    beta = torch.flatten(output[3])
+
+                    mu = mu.detach().cpu().numpy()
+                    v = v.detach().cpu().numpy()
+                    alpha = alpha.detach().cpu().numpy()
+                    beta = beta.detach().cpu().numpy()
+                    var = np.sqrt(beta / (v * (alpha - 1)))
+                    target = data.y.cpu().numpy()
+                    predict =  np.column_stack((mu, v, alpha, beta, var))
+                else:
+                    ids_temp = [
+                        item for sublist in data.structure_id for item in sublist
+                    ]
+                    ids_temp = [item for sublist in ids_temp for item in sublist]
+                    ids = ids + ids_temp
+                    
+                    mu = torch.flatten(output[0])
+                    v = torch.flatten(output[1])
+                    alpha = torch.flatten(output[2])
+                    beta = torch.flatten(output[3])
+
+                    mu = mu.detach().cpu().numpy()
+                    v = v.detach().cpu().numpy()
+                    alpha = alpha.detach().cpu().numpy()
+                    beta = beta.detach().cpu().numpy()
+                    var = np.sqrt(beta / (v * (alpha - 1)))
+                    
+                    predict = np.concatenate(
+                        (predict, np.column_stack((mu, v, alpha, beta, var))), axis=0
+                    )
+                    target = np.concatenate((target, data.y.cpu().numpy()), axis=0)
+            
+            count = count + torch.flatten(output[0]).size(0)
+            
+                
+    loss_all = loss_all / count            
+    if out == True:
+        ids = [float(i) for i in ids]
+        test_out = np.column_stack((ids, target, predict))
+        mydf = pd.DataFrame(test_out)
+
+        mydf.rename(columns={0: 'ids', 1: 'target', 2: 'mu', 3:'v', 4:'alpha', 5:'beta', 6:'var'}, inplace=True)
+        mydf['SD'] = np.sqrt(mydf['var'])
+        mydf['error'] = mydf['target'] - mydf['mu']
+        
+        return loss_all, mydf
+    elif out == False:
+        return loss_all
+
+
+def train(model, optimizer, loader, loss_method, rank, my_coeff = 1):
     model.train()
     loss_all = 0
     count = 0
@@ -41,56 +141,69 @@ def train(model, optimizer, loader, loss_method, rank):
         optimizer.zero_grad()
         output = model(data)
         # print(data.y.shape, output.shape)
-        loss = getattr(F, loss_method)(output, data.y)
-        loss.backward()
-        loss_all += loss.detach() * output.size(0)
+        if loss_method == "evidential":
+            loss =  evidential_regresssion_loss(data.y, output, my_coeff)
+            loss.backward()
+            loss_all += loss.detach() * torch.flatten(output[0]).size(0)
+            optimizer.step()
+            count = count + torch.flatten(output[0]).size(0)
+        else:
+            loss = getattr(F, loss_method)(output, data.y)
+            loss.backward()
+            loss_all += loss.detach() * output.size(0)
+            optimizer.step()
+            count = count + output.size(0)
 
         # clip = 10
         # torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
 
-        optimizer.step()
-        count = count + output.size(0)
+        
 
     loss_all = loss_all / count
     return loss_all
 
 
 ##Evaluation step, runs model in eval mode
-def evaluate(loader, model, loss_method, rank, out=False):
-    model.eval()
-    loss_all = 0
-    count = 0
-    for data in loader:
-        data = data.to(rank)
-        with torch.no_grad():
-            output = model(data)
-            loss = getattr(F, loss_method)(output, data.y)
-            loss_all += loss * output.size(0)
-            if out == True:
-                if count == 0:
-                    ids = [item for sublist in data.structure_id for item in sublist]
-                    ids = [item for sublist in ids for item in sublist]
-                    predict = output.data.cpu().numpy()
-                    target = data.y.cpu().numpy()
-                else:
-                    ids_temp = [
-                        item for sublist in data.structure_id for item in sublist
-                    ]
-                    ids_temp = [item for sublist in ids_temp for item in sublist]
-                    ids = ids + ids_temp
-                    predict = np.concatenate(
-                        (predict, output.data.cpu().numpy()), axis=0
-                    )
-                    target = np.concatenate((target, data.y.cpu().numpy()), axis=0)
-            count = count + output.size(0)
+def evaluate(loader, model, loss_method, rank, out=False, my_coeff = 0.5):
+    if loss_method == "evidential":
+        return ev_evaluate(loader, model, loss_method, rank, out, my_coeff)
+    else:
+        model.eval()
+        loss_all = 0
+        count = 0
+        for data in loader:
+            data = data.to(rank)
+            with torch.no_grad():
+                output = model(data)
+                loss = getattr(F, loss_method)(output, data.y)
+                loss_all += loss * output.size(0)
 
-    loss_all = loss_all / count
+                if out == True:
+                    if count == 0:
+                        ids = [item for sublist in data.structure_id for item in sublist]
+                        ids = [item for sublist in ids for item in sublist]
+                        predict = output.data.cpu().numpy()
+                        target = data.y.cpu().numpy()
+                    else:
+                        ids_temp = [
+                            item for sublist in data.structure_id for item in sublist
+                        ]
+                        ids_temp = [item for sublist in ids_temp for item in sublist]
+                        ids = ids + ids_temp
+                        predict = np.concatenate(
+                            (predict, output.data.cpu().numpy()), axis=0
+                        )
+                        target = np.concatenate((target, data.y.cpu().numpy()), axis=0)
 
-    if out == True:
-        test_out = np.column_stack((ids, target, predict))
-        return loss_all, test_out
-    elif out == False:
-        return loss_all
+                count = count + output.size(0)
+
+        loss_all = loss_all / count
+
+        if out == True:
+            test_out = np.column_stack((ids, target, predict))
+            return loss_all, test_out
+        elif out == False:
+            return loss_all
 
 
 ##Model trainer
@@ -107,8 +220,8 @@ def trainer(
     epochs,
     verbosity,
     filename = "my_model_temp.pth",
+    coeff = 1,
 ):
-
     train_error = val_error = test_error = epoch_time = float("NaN")
     train_start = time.time()
     best_val_error = 1e10
@@ -120,21 +233,21 @@ def trainer(
         if rank not in ("cpu", "cuda"):
             train_sampler.set_epoch(epoch)
         ##Train model
-        train_error = train(model, optimizer, train_loader, loss, rank=rank)
+        train_error = train(model, optimizer, train_loader, loss, rank=rank, my_coeff = coeff)
         if rank not in ("cpu", "cuda"):
             torch.distributed.reduce(train_error, dst=0)
             train_error = train_error / world_size
-
+        
         ##Get validation performance
         if rank not in ("cpu", "cuda"):
             dist.barrier()
         if val_loader != None and rank in (0, "cpu", "cuda"):
             if rank not in ("cpu", "cuda"):
                 val_error = evaluate(
-                    val_loader, model.module, loss, rank=rank, out=False
+                    val_loader, model.module, loss, rank=rank, out=False, my_coeff = coeff
                 )
             else:
-                val_error = evaluate(val_loader, model, loss, rank=rank, out=False)
+                val_error = evaluate(val_loader, model, loss, rank=rank, out=False, my_coeff = coeff)
 
         ##Train loop timings
         epoch_time = time.time() - train_start
@@ -191,6 +304,7 @@ def trainer(
                 )
 
         ##scheduler on train error
+        
         scheduler.step(train_error)
 
         ##Print performance
@@ -382,6 +496,7 @@ def train_regular(
     job_parameters=None,
     training_parameters=None,
     model_parameters=None,
+    processing_args = None
 ):
     ##DDP
     ddp_setup(rank, world_size)
@@ -390,11 +505,12 @@ def train_regular(
         model_parameters["lr"] = model_parameters["lr"] * world_size
 
     ##Get dataset
-    dataset = process.get_dataset(data_path, training_parameters["target_index"], False)
+    dataset = process.get_dataset(data_path, training_parameters["target_index"], False, processing_args)
 
     if rank not in ("cpu", "cuda"):
         dist.barrier()
-
+    if model_parameters['coeff'] is not None:
+        my_coeff = model_parameters['coeff'] 
     ##Set up loader
     (
         train_loader,
@@ -402,8 +518,8 @@ def train_regular(
         test_loader,
         train_sampler,
         train_dataset,
-        _,
-        _,
+        val_dataset,
+        test_dataset,
     ) = loader_setup(
         training_parameters["train_ratio"],
         training_parameters["val_ratio"],
@@ -450,6 +566,7 @@ def train_regular(
         model_parameters["epochs"],
         training_parameters["verbosity"],
         "my_model_temp.pth",
+        my_coeff
     )
 
     if rank in (0, "cpu", "cuda"):
@@ -465,26 +582,62 @@ def train_regular(
             num_workers=0,
             pin_memory=True,
         )
-
-        ##Get train error in eval mode
-        train_error, train_out = evaluate(
-            train_loader, model, training_parameters["loss"], rank, out=True
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=model_parameters["batch_size"],
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
         )
-        print("Train Error: {:.5f}".format(train_error))
-
-        ##Get val error
-        if val_loader != None:
-            val_error, val_out = evaluate(
-                val_loader, model, training_parameters["loss"], rank, out=True
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=model_parameters["batch_size"],
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
+        )
+        if training_parameters["loss"] == "evidential":
+            
+            ##Get train error in eval mode
+            train_error, train_out = ev_evaluate(
+                train_loader, model, training_parameters["loss"], rank, True, my_coeff
             )
-            print("Val Error: {:.5f}".format(val_error))
+            print("Train Error: {:.5f}".format(train_error))
 
-        ##Get test error
-        if test_loader != None:
-            test_error, test_out = evaluate(
-                test_loader, model, training_parameters["loss"], rank, out=True
+            ##Get val error
+            if val_loader != None:
+                val_error, val_out = ev_evaluate(
+                    val_loader, model, training_parameters["loss"], rank, True, my_coeff
+                )
+                print("Val Error: {:.5f}".format(val_error))
+
+            ##Get test error
+            if test_loader != None:
+                test_error, test_out = ev_evaluate(
+                    test_loader, model, training_parameters["loss"], rank, True, my_coeff
+                )
+                print("Test Error: {:.5f}".format(test_error))
+        else:
+            
+            ##Get train error in eval mode
+            train_error, train_out = evaluate(
+                train_loader, model, training_parameters["loss"], rank, out=True
             )
-            print("Test Error: {:.5f}".format(test_error))
+            print("Train Error: {:.5f}".format(train_error))
+
+            ##Get val error
+            if val_loader != None:
+                val_error, val_out = evaluate(
+                    val_loader, model, training_parameters["loss"], rank, out=True
+                )
+                print("Val Error: {:.5f}".format(val_error))
+
+            ##Get test error
+            if test_loader != None:
+                test_error, test_out = evaluate(
+                    test_loader, model, training_parameters["loss"], rank, out=True
+                )
+                print("Test Error: {:.5f}".format(test_error))
 
         ##Save model
         if job_parameters["save_model"] == "True":
@@ -512,18 +665,29 @@ def train_regular(
 
         ##Write outputs
         if job_parameters["write_output"] == "True":
-
-            write_results(
-                train_out, str(job_parameters["job_name"]) + "_train_outputs.csv"
-            )
-            if val_loader != None:
+            if training_parameters["loss"] == "evidential":
+                train_name = str(job_parameters["job_name"]) + "_train_outputs.csv"
+                train_out.to_csv(path_or_buf = train_name, index = False)
+                
+                if val_loader != None:
+                    val_name = str(job_parameters["job_name"]) + "_val_outputs.csv"
+                    val_out.to_csv(path_or_buf = val_name, index = False)
+                 
+                if test_loader != None:
+                    test_name = str(job_parameters["job_name"]) + "_test_outputs.csv"
+                    test_out.to_csv(path_or_buf = test_name, index = False)
+            else:
                 write_results(
-                    val_out, str(job_parameters["job_name"]) + "_val_outputs.csv"
+                    train_out, str(job_parameters["job_name"]) + "_train_outputs.csv"
                 )
-            if test_loader != None:
-                write_results(
-                    test_out, str(job_parameters["job_name"]) + "_test_outputs.csv"
-                )
+                if val_loader != None:
+                    write_results(
+                        val_out, str(job_parameters["job_name"]) + "_val_outputs.csv"
+                    )
+                if test_loader != None:
+                    write_results(
+                        test_out, str(job_parameters["job_name"]) + "_test_outputs.csv"
+                    )
 
         if rank not in ("cpu", "cuda"):
             dist.destroy_process_group()
@@ -1113,7 +1277,7 @@ def train_ensemble(
                     nprocs=world_size,
                     join=True,
                 )
-            if job_parameters["parallel"] == "False":
+            if job_parameters["parallel"] == "False": 
                 print("Running on one GPU")
                 training.train_regular(
                     "cuda",
@@ -1330,8 +1494,8 @@ def split_data_bootstrap(
         
         
         total_ind = train_dataset.indices
-        c_range = range(0, len(total_ind))
-        my_indices = create_random_indices(c_range, num_samples)
+        #c_range = range(0, len(total_ind))
+        my_indices = create_random_indices(total_ind, num_samples)
         training_bootstrapped = []
 
 
@@ -1437,6 +1601,7 @@ def loader_setup_bootstrap(
         test_loader,
         train_sampler,
         train_sets,
+        train_dataset,
         val_dataset,
         test_dataset
     )
@@ -1473,6 +1638,7 @@ def train_regular_bootstrap(
         test_loader,
         train_sampler,
         train_sets,
+        train_dataset,
         _,
         _,
     ) = loader_setup_bootstrap(
@@ -1557,7 +1723,7 @@ def train_regular_bootstrap(
 
             ##Get train error in eval mode
             ########### USE .training #############
-            train_error, train_out = training.evaluate(
+            train_error, train_out = evaluate(
                 train_loader, model, training_parameters["loss"], rank, out=True
             )
             print("Train Error: {:.5f}".format(train_error))
@@ -1565,7 +1731,7 @@ def train_regular_bootstrap(
             ##Get val error
             if val_loader != None:
                 ########### USE .training #############
-                val_error, val_out = training.evaluate(
+                val_error, val_out = evaluate(
                     val_loader, model, training_parameters["loss"], rank, out=True
                 )
                 print("Val Error: {:.5f}".format(val_error))
@@ -1573,7 +1739,7 @@ def train_regular_bootstrap(
             ##Get test error
             if test_loader != None:
                 ########### USE .training #############
-                test_error, test_out = training.evaluate(
+                test_error, test_out = evaluate(
                     test_loader, model, training_parameters["loss"], rank, out=True
                 )
                 print("Test Error: {:.5f}".format(test_error))
@@ -1639,8 +1805,10 @@ def train_regular_bootstrap(
                     error_values[np.newaxis, ...],
                     delimiter=",",
                 )          
-    if get_CI == True:     
-        predict_ci(training_parameters["loss"], n_samples, job_parameters, rank, test_loader)
+    if get_CI == True:
+        count_ids(train_dataset, train_sets)
+        predict_ci(training_parameters["loss"], n_samples, job_parameters, rank, val_loader, 'val')     
+        predict_ci(training_parameters["loss"], n_samples, job_parameters, rank, test_loader, 'test')
     return error_values
 
 
@@ -1658,7 +1826,7 @@ def all_equal(iterator):
     return all(val)
 
 
-def predict_ci(loss, num_models, job_parameters, rank, loader, write_output = True):
+def predict_ci(loss, num_models, job_parameters, rank, loader, set_name, datset = None,  write_output = True):
     models = []
     predictions = []
     target_val = []
@@ -1685,7 +1853,7 @@ def predict_ci(loss, num_models, job_parameters, rank, loader, write_output = Tr
         model = model.to(rank)
         model_summary(model)
         time_start = time.time()
-        test_error, test_out = training.evaluate(loader, model, loss, rank, out=True)
+        test_error, test_out = evaluate(loader, model, loss, rank, out=True)
         elapsed_time = time.time() - time_start
         if i == 0:
             labs_target = test_out[:,[0,1]]
@@ -1696,6 +1864,7 @@ def predict_ci(loss, num_models, job_parameters, rank, loader, write_output = Tr
     float_pred = [i.astype(float) for i in predictions]
 
     means = np.mean(float_pred, axis = 0)
+    my_sd = np.std(float_pred, axis = 0)
     two_sd = np.std(float_pred, axis = 0)*2
     top_ci = np.add(means, two_sd)
     bot_ci = np.subtract(means, two_sd)
@@ -1705,15 +1874,12 @@ def predict_ci(loss, num_models, job_parameters, rank, loader, write_output = Tr
     bot_ci = bot_ci.reshape(bot_ci.shape[0],-1)
     means = means.reshape(means.shape[0],-1)
     top_ci = top_ci.reshape(top_ci.shape[0],-1)
-    all_ci_dat = (np.concatenate((labs_target,bot_ci, means, top_ci),axis=1))
-    in_ci = np.array([int(row[2] <= row[3] <= row[4]) for row in all_ci_dat])
-    in_ci = in_ci.reshape(in_ci.shape[0],-1)
-    all_ci_dat = np.concatenate((all_ci_dat,in_ci), axis = 1)
+    my_sd = my_sd.reshape(top_ci.shape[0],-1)
+    all_ci_dat = (np.concatenate((labs_target,bot_ci, means, top_ci,my_sd),axis=1))
 
-    print("% of targets inside CI:" + str((sum(in_ci)/len(in_ci))[0]))
     if write_output == True:
 
-        with open(str(job_parameters["job_name"])+ "_confidence_int.csv", "w") as f:
+        with open(str(job_parameters["job_name"])+ set_name + "_confidence_int.csv", "w") as f:
             csvwriter = csv.writer(f)
             for i in range(0, len(all_ci_dat) + 1):
                 if i == 0:
@@ -1724,8 +1890,396 @@ def predict_ci(loss, num_models, job_parameters, rank, loader, write_output = Tr
                             "bottom_confidence_interval",
                             "mean_output",
                             "top_confidence_interval",
-                            "inside_ci"
+                            "Standard_Deviation"
                         ]
                     )
                 elif i > 0:
                     csvwriter.writerow(all_ci_dat[i - 1, :])
+                    
+def count_ids(dataset, train_sets):
+    
+    if dataset is not None:
+
+        tot_ids = dataset.indices
+        my_ids = []
+
+        for i in range(0, len(train_sets)):
+            my_ids = my_ids + train_sets[i].indices
+
+        frame_dict = {'ids': np.unique(tot_ids).tolist(), 'count': np.repeat(0,len(np.unique(tot_ids).tolist()))}
+        freq = pd.DataFrame(frame_dict)
+
+        for item in my_ids: 
+            if (item in freq['ids'].tolist()): 
+                freq['count'][freq['ids'] == item] += 1
+            else: 
+                print('oopsie')
+
+
+        with open("bootstrap_freq_training_ids.csv", "w") as f:
+
+
+
+            csvwriter = csv.writer(f)
+            for i in range(0, len(all_ci_dat) + 1):
+                if i == 0:
+                    csvwriter.writerow(
+                        [
+                            "ids",
+                            'count'
+                        ]
+                    )
+                elif i > 0:
+                    csvwriter.writerow(frq[i - 1, :])
+
+
+
+
+
+
+
+
+#Train a two models one for the data and one for the model errors and find an alpha non-comformity factors to model errors
+#using a regular train test split
+
+def train_ic_errors(
+    rank,
+    world_size,
+    data_path,
+    job_parameters=None,
+    training_parameters=None,
+    model_parameters=None,
+    processing_args=None
+):
+    ##DDP
+    ddp_setup(rank, world_size)
+    ##some issues with DDP learning rate
+    if rank not in ("cpu", "cuda"):
+        model_parameters["lr"] = model_parameters["lr"] * world_size
+
+    ##Get dataset
+    dataset = process.get_dataset(data_path, training_parameters["target_index"], False)
+
+
+
+    if rank not in ("cpu", "cuda"):
+        dist.barrier()
+
+    ##Set up loader
+    (
+        train_loader,
+        val_loader,
+        test_loader,
+        train_sampler,
+        train_dataset,
+        val_dataset,
+        test_dataset,
+    ) = loader_setup(
+        training_parameters["train_ratio"],
+        training_parameters["val_ratio"],
+        training_parameters["test_ratio"],
+        model_parameters["batch_size"],
+        dataset,
+        rank,
+        job_parameters["seed"],
+        world_size,
+    )
+
+    ##Set up model
+    model = model_setup(
+        rank,
+        model_parameters["model"],
+        model_parameters,
+        dataset,
+        job_parameters["load_model"],
+        job_parameters["model_path"],
+        model_parameters.get("print_model", True),
+    )
+
+    ##Set-up optimizer & scheduler
+    optimizer = getattr(torch.optim, model_parameters["optimizer"])(
+        model.parameters(),
+        lr=model_parameters["lr"],
+        **model_parameters["optimizer_args"]
+    )
+    scheduler = getattr(torch.optim.lr_scheduler, model_parameters["scheduler"])(
+        optimizer, **model_parameters["scheduler_args"]
+    )
+
+    ##Start training
+    model = trainer(
+        rank,
+        world_size,
+        model,
+        optimizer,
+        scheduler,
+        training_parameters["loss"],
+        train_loader,
+        val_loader,
+        train_sampler,
+        model_parameters["epochs"],
+        training_parameters["verbosity"],
+        "my_model_temp.pth",
+    )
+
+    if rank in (0, "cpu", "cuda"):
+
+        train_error = val_error = test_error = float("NaN")
+
+        ##workaround to get training output in DDP mode
+        ##outputs are slightly different, could be due to dropout or batchnorm?
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=model_parameters["batch_size"],
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
+        )
+
+        test_loader = training.DataLoader(
+                        test_dataset,
+                        batch_size=model_parameters["batch_size"],
+                        shuffle=False,
+                        num_workers=0,
+                        pin_memory=True,
+                    )
+
+        val_loader = training.DataLoader(
+                        val_dataset,
+                        batch_size=model_parameters["batch_size"],
+                        shuffle=False,
+                        num_workers=0,
+                        pin_memory=True,
+                    )
+
+        ##Get train error in eval mode
+        train_error, train_out = evaluate(
+            train_loader, model, training_parameters["loss"], rank, out=True
+        )
+        print("Train Error: {:.5f}".format(train_error))
+
+        ##Get val error
+        if val_loader != None:
+            val_error, val_out = evaluate(
+                val_loader, model, training_parameters["loss"], rank, out=True
+            )
+            print("Val Error: {:.5f}".format(val_error))
+
+        ##Get test error
+        if test_loader != None:
+            test_error, test_out = evaluate(
+                test_loader, model, training_parameters["loss"], rank, out=True
+            )
+            print("Test Error: {:.5f}".format(test_error))
+
+        ##Save model
+        if job_parameters["save_model"] == "True":
+
+            if rank not in ("cpu", "cuda"):
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "full_model": model,
+                    },
+                    job_parameters["model_path"],
+                )
+            else:
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "full_model": model,
+                    },
+                    job_parameters["model_path"],
+                )
+        target_train = pd.DataFrame(train_out, columns=['index', 'target', 'predicted'])
+        target_val = pd.DataFrame(val_out, columns=['index', 'target', 'predicted']) 
+        target_test = pd.DataFrame(test_out, columns=['index', 'target', 'predicted']) 
+        target_errors = pd.concat([target_train,target_val,target_test], axis = 0)
+        target_errors = target_errors.sort_values(list(target_errors), ascending=True)
+        target_errors['error'] = np.absolute(target_errors['target'].apply(float) - target_errors['predicted'].apply(float))
+        target_errors[['index','error']].to_csv(os.path.join(os.getcwd(),data_path,'error_targets.csv'), index = False, header=False)
+
+
+        new_data = process.get_dataset_error(data_path ,training_parameters["target_index"], False, processing_args)
+        error_train_subset =  torch.utils.data.Subset(new_data, train_dataset.indices)
+        error_val_subset = torch.utils.data.Subset(new_data, val_dataset.indices)
+        error_test_subset = torch.utils.data.Subset(new_data, test_dataset.indices)
+
+        train_loader_e = DataLoader(
+            error_train_subset,
+            batch_size=model_parameters["batch_size"],
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
+        )
+
+        val_loader_e = DataLoader(
+                        error_val_subset,
+                        batch_size=model_parameters["batch_size"],
+                        shuffle=False,
+                        num_workers=0,
+                        pin_memory=True,
+                    )
+
+        test_loader_e = DataLoader(
+                        error_test_subset,
+                        batch_size=model_parameters["batch_size"],
+                        shuffle=False,
+                        num_workers=0,
+                        pin_memory=True,
+                    )
+
+        model_errors = model_setup(
+                rank,
+                model_parameters["model"],
+                model_parameters,
+                new_data,
+                job_parameters["load_model"],
+                job_parameters["model_path"],
+                model_parameters.get("print_model", True),
+            ) 
+
+        ##Set-up optimizer & scheduler
+        optimizer = getattr(torch.optim, model_parameters["optimizer"])(
+            model_errors.parameters(),
+            lr=model_parameters["lr"],
+            **model_parameters["optimizer_args"]
+        )
+        scheduler = getattr(torch.optim.lr_scheduler, model_parameters["scheduler"])(
+            optimizer, **model_parameters["scheduler_args"]
+        )
+
+        ##Start training
+        model_errors = trainer(
+            rank,
+            world_size,
+            model_errors,
+            optimizer,
+            scheduler,
+            training_parameters["loss"],
+            train_loader_e,
+            val_loader_e,
+            train_sampler,
+            model_parameters["epochs"],
+            training_parameters["verbosity"],
+            "my_model_error_temp.pth",
+        )
+
+        train_error_e, train_out_e = evaluate(
+            train_loader_e, model_errors, training_parameters["loss"], rank, out=True)
+
+        val_error_e, val_out_e = evaluate(
+            val_loader_e, model_errors, training_parameters["loss"], rank, out=True)
+
+        test_error_e, test_out_e = evaluate(
+            test_loader_e, model_errors, training_parameters["loss"], rank, out=True)
+
+
+        target_train_e = pd.DataFrame(train_out_e, columns=['index', 'target_error', 'predicted_error'])
+        target_val_e = pd.DataFrame(val_out_e, columns=['index', 'target_error', 'predicted_error']) 
+        target_test_e = pd.DataFrame(test_out_e, columns=['index', 'target_error', 'predicted_error']) 
+        target_errors_e = pd.concat([target_train_e,target_val_e,target_test_e], axis = 0)
+        target_errors_e = target_errors_e.sort_values(list(target_errors_e), ascending=True)
+        target_errors_e['error_2'] = np.absolute(target_errors_e['target_error'].apply(float) - target_errors_e['predicted_error'].apply(float))
+        
+        target_val_e_2 = copy.copy(target_val_e)
+        target_val_e_2['target_error'] = target_val_e_2['target_error'].apply(float)
+        target_val_e_2['predicted_error'] = target_val_e_2['predicted_error'].apply(float)
+        target_val_e_2['alpha'] = target_val_e_2['target_error']/target_val_e_2['predicted_error']
+
+        target_val_e_2 = target_val_e_2.sort_values(['alpha'], axis=0, ascending=True)
+        alpha = np.percentile(target_val_e_2['alpha'], 95)
+
+        target_train_e['predicted_error'] = target_train_e['predicted_error'].apply(float)
+        target_train_e['lower_error_confidence_level'] = target_train_e['predicted_error'] - alpha
+        target_train_e['upper_error_confidence_level'] = target_train_e['predicted_error'] + alpha
+
+        target_val_e['predicted_error'] = target_val_e['predicted_error'].apply(float)
+        target_val_e['lower_error_confidence_level'] = target_val_e['predicted_error'] - alpha
+        target_val_e['upper_error_confidence_level'] = target_val_e['predicted_error'] + alpha
+
+        target_test_e['predicted_error'] = target_test_e['predicted_error'].apply(float)
+        target_test_e['lower_error_confidence_level'] = target_test_e['predicted_error'] - alpha
+        target_test_e['upper_error_confidence_level'] = target_test_e['predicted_error'] + alpha
+
+
+        target_train_e.to_csv(os.path.join(os.getcwd(),data_path,'error_prediction_conf_train.csv'), index = False, header=False)
+        target_val_e.to_csv(os.path.join(os.getcwd(),data_path,'error_prediction_conf_val.csv'), index = False, header=False)
+        target_test_e.to_csv(os.path.join(os.getcwd(),data_path,'error_prediction_conf_test.csv'), index = False, header=False)
+
+                ##Write outputs
+        if job_parameters["write_output"] == "True":
+
+            write_results(
+                train_out, str(job_parameters["job_name"]) + "_train_outputs.csv"
+            )
+            if val_loader != None:
+                write_results(
+                    val_out, str(job_parameters["job_name"]) + "_val_outputs.csv"
+                )
+            if test_loader != None:
+                write_results(
+                    test_out, str(job_parameters["job_name"]) + "_test_outputs.csv"
+                )
+
+        if rank not in ("cpu", "cuda"):
+            dist.destroy_process_group()
+
+        ##Write out model performance to file
+        error_values = np.array((train_error.cpu(), val_error.cpu(), test_error.cpu()))
+        if job_parameters.get("write_error") == "True":
+            np.savetxt(
+                job_parameters["job_name"] + "_errorvalues.csv",
+                error_values[np.newaxis, ...],
+                delimiter=",",
+            )
+
+        return error_values
+
+
+###Predict using a saved movel
+def predict(dataset, loss, job_parameters=None):
+
+    rank = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    ##Loads predict dataset in one go, care needed for large datasets)
+    loader = DataLoader(
+        dataset,
+        batch_size=128,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+    )
+
+    ##Load saved model
+    assert os.path.exists(job_parameters["model_path"]), "Saved model not found"
+    if str(rank) == "cpu":
+        saved = torch.load(
+            job_parameters["model_path"], map_location=torch.device("cpu")
+        )
+    else:
+        saved = torch.load(
+            job_parameters["model_path"], map_location=torch.device("cuda")
+        )
+    model = saved["full_model"]
+    model = model.to(rank)
+    model_summary(model)
+
+    ##Get predictions
+    time_start = time.time()
+    test_error, test_out = evaluate(loader, model, loss, rank, out=True)
+    elapsed_time = time.time() - time_start
+
+    print("Evaluation time (s): {:.5f}".format(elapsed_time))
+
+    ##Write output
+    if job_parameters["write_output"] == "True":
+        write_results(
+            test_out, str(job_parameters["job_name"]) + "_predicted_outputs.csv"
+        )
+
+    return test_error

@@ -9,6 +9,7 @@ from torch_geometric.nn import (
     global_add_pool,
     global_max_pool,
     MetaLayer,
+    DiffGroupNorm
 )
 from torch_scatter import scatter_mean, scatter_add, scatter_max, scatter
 
@@ -35,7 +36,8 @@ class Megnet_EdgeModel(torch.nn.Module):
                 lin = torch.nn.Linear(dim, dim)
                 self.edge_mlp.append(lin) 
             if self.batch_norm == "True":
-                bn = BatchNorm1d(dim, track_running_stats=self.batch_track_stats)
+                #bn = BatchNorm1d(dim, track_running_stats=self.batch_track_stats)
+                bn = DiffGroupNorm(dim, 10, track_running_stats=self.batch_track_stats)
                 self.bn_list.append(bn)            
 
     def forward(self, src, dest, edge_attr, u, batch):
@@ -47,12 +49,15 @@ class Megnet_EdgeModel(torch.nn.Module):
                 if self.batch_norm == "True":
                     out = self.bn_list[i](out)
                 out = F.dropout(out, p=self.dropout_rate, training=self.training)
+                prev_out = out
             else:    
                 out = self.edge_mlp[i](out)
                 out = getattr(F, self.act)(out)    
                 if self.batch_norm == "True":
                     out = self.bn_list[i](out)
-                out = F.dropout(out, p=self.dropout_rate, training=self.training)   
+                out = torch.add(out, prev_out)
+                out = F.dropout(out, p=self.dropout_rate, training=self.training)
+                prev_out = out
         return out
 
 
@@ -78,7 +83,8 @@ class Megnet_NodeModel(torch.nn.Module):
                 lin = torch.nn.Linear(dim, dim)
                 self.node_mlp.append(lin) 
             if self.batch_norm == "True":
-                bn = BatchNorm1d(dim, track_running_stats=self.batch_track_stats)
+                #bn = BatchNorm1d(dim, track_running_stats=self.batch_track_stats)
+                bn = DiffGroupNorm(dim, 10, track_running_stats=self.batch_track_stats)
                 self.bn_list.append(bn)    
 
     def forward(self, x, edge_index, edge_attr, u, batch):
@@ -92,12 +98,15 @@ class Megnet_NodeModel(torch.nn.Module):
                 if self.batch_norm == "True":
                     out = self.bn_list[i](out)
                 out = F.dropout(out, p=self.dropout_rate, training=self.training)
+                prev_out = out
             else:    
                 out = self.node_mlp[i](out)
                 out = getattr(F, self.act)(out)    
                 if self.batch_norm == "True":
                     out = self.bn_list[i](out)
-                out = F.dropout(out, p=self.dropout_rate, training=self.training)   
+                out = torch.add(out, prev_out)
+                out = F.dropout(out, p=self.dropout_rate, training=self.training)
+                prev_out = out
         return out
 
 
@@ -123,7 +132,8 @@ class Megnet_GlobalModel(torch.nn.Module):
                 lin = torch.nn.Linear(dim, dim)
                 self.global_mlp.append(lin) 
             if self.batch_norm == "True":
-                bn = BatchNorm1d(dim, track_running_stats=self.batch_track_stats)
+                #bn = BatchNorm1d(dim, track_running_stats=self.batch_track_stats)
+                bn = DiffGroupNorm(dim, 10, track_running_stats=self.batch_track_stats)
                 self.bn_list.append(bn)  
 
     def forward(self, x, edge_index, edge_attr, u, batch):
@@ -138,12 +148,15 @@ class Megnet_GlobalModel(torch.nn.Module):
                 if self.batch_norm == "True":
                     out = self.bn_list[i](out)
                 out = F.dropout(out, p=self.dropout_rate, training=self.training)
+                prev_out = out
             else:    
                 out = self.global_mlp[i](out)
                 out = getattr(F, self.act)(out)    
                 if self.batch_norm == "True":
                     out = self.bn_list[i](out)
-                out = F.dropout(out, p=self.dropout_rate, training=self.training)   
+                out = torch.add(out, prev_out)
+                out = F.dropout(out, p=self.dropout_rate, training=self.training)
+                prev_out = out
         return out
 
 
@@ -296,9 +309,13 @@ class MEGNet(torch.nn.Module):
             if i == 0:
                 out = self.pre_lin_list[i](data.x)
                 out = getattr(F, self.act)(out)
+                #prev_out = out
             else:
                 out = self.pre_lin_list[i](out)
                 out = getattr(F, self.act)(out)
+                #out = torch.add(out, prev_out)
+                #prev_out = out
+        #prev_out = out
 
         ##GNN layers        
         for i in range(0, len(self.conv_list)):
@@ -323,6 +340,9 @@ class MEGNet(torch.nn.Module):
                     x = torch.add(x_out, x_temp)
                     e = torch.add(e_out, e_temp)
                     u = torch.add(u_out, u_temp)
+                prev_x = x
+                prev_e = e
+                prev_u = u
                     
             elif i > 0:
                 e_temp = self.e_embed_list[i](e)
@@ -333,7 +353,17 @@ class MEGNet(torch.nn.Module):
                 )
                 x = torch.add(x_out, x)
                 e = torch.add(e_out, e)
-                u = torch.add(u_out, u)          
+                u = torch.add(u_out, u)
+                
+                x = torch.add(x, prev_x)
+                e = torch.add(e, prev_e)
+                u = torch.add(u, prev_u)
+
+                prev_x = x
+                prev_e = e
+                prev_u = u
+
+                      
 
         ##Post-GNN dense layers
         if self.pool_order == "early":
@@ -347,21 +377,33 @@ class MEGNet(torch.nn.Module):
                 e_pool = scatter(e, data.edge_index[0, :], dim=0, reduce=self.pool_reduce)
                 e_pool = scatter(e_pool, data.batch, dim=0, reduce=self.pool_reduce)
                 out = torch.cat([x_pool, e_pool, u], dim=1)
+            #prev_out = out
             for i in range(0, len(self.post_lin_list)):
                 out = self.post_lin_list[i](out)
                 out = getattr(F, self.act)(out)
+                #out = torch.add(out, prev_out)
+                #prev_out = out
             out = self.lin_out(out)
+            #out = torch.add(out, prev_out)
+            #prev_out = out
 
         ##currently only uses node features for late pooling
         elif self.pool_order == "late":
             out = x
+            #prev_out = out
             for i in range(0, len(self.post_lin_list)):
                 out = self.post_lin_list[i](out)
                 out = getattr(F, self.act)(out)
+                #out = torch.add(out, prev_out)
+                #prev_out = out
             out = self.lin_out(out)
+            #out = torch.add(out, prev_out)
+            #prev_out = out
             if self.pool == "set2set":
                 out = self.set2set_x(out, data.batch)
                 out = self.lin_out_2(out)
+                #out = torch.add(out, prev_out)
+                #prev_out = out
             else:
                 out = getattr(torch_geometric.nn, self.pool)(out, data.batch)
                 
