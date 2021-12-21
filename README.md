@@ -2,7 +2,7 @@
 
 # MatDeepLearn
 
-## Copied from https://github.com/vxfung/MatDeepLearn, utlizing code to create confidence intervals in model training
+## Credit to https://github.com/vxfung/MatDeepLearn, utlizing the MatDeepLearn platform to create confidence intervals in GNN predictions
 ## Models Tested:
 <ol>
 	<li>Inductive Conformal Regression</li>
