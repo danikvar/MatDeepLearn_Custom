@@ -5,12 +5,16 @@
 ## Copied from https://github.com/vxfung/MatDeepLearn, utlizing code to create confidence intervals in model training
 ## Models Tested:
 <ol>
-	<li>Indiuctive Conformal Regression</li>
+	<li>Inductive Conformal Regression</li>
 	<li>Boostrap Ensemble</li>
 	<li>Deep Evidential Regression</li>
 	<li>Bayesian Graph Neural Network Uncertainty</li>
 
 </ol>
+
+The MegNet model and l1 loss was utilized in both the Bootstrap Ensemble and Inductive Conformal Uncertainty prediction trials. A modified version of the MegNet model utilizing Evidential Regression layers and a custom evidential loss function was utilized for the Evidential Regression trial. Modified Bayesian Layers were added to the CGCNN and kl divergence and negative log likelihood were utilized in the Bayesian trial. All trials were ran on the Pt NanoCluster dataset.
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 MatDeepLearn is a platform for testing and using graph neural networks (GNNs) and other machine learning (ML) models for materials chemistry applications. MatDeepLearn takes in data in the form of atomic structures and their target properties, processes the data into graphs, trains the ML model of choice (optionally with hyperparameter optimization), and provides predictions on unseen data. It allows for different GNNs to be benchmarked on diverse datasets drawn from materials repositories as well as conventional training/prediction tasks. This package makes use of the [Pytorch-Geometric](https://github.com/rusty1s/pytorch_geometric) library, which provides powerful tools for GNN development and many prebuilt models readily available for use.
 
